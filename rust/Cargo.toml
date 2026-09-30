@@ -1,0 +1,19 @@
+[package]
+name = "hraness-cli-update"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Policy, ownership, and release verification for Hraness native CLI updates"
+license = "MIT"
+repository = "https://github.com/hraness/cli-update"
+readme = "README.md"
+
+[dependencies]
+fs2 = "0.4.3"
+semver = { version = "1.0.26", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.172"
