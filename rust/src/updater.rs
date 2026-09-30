@@ -162,7 +162,7 @@ pub struct InstallRequest<'a> {
     pub automatic: bool,
     updater: &'a Updater,
     coordination: &'a Store,
-    activity_lock: &'a File,
+    activity_lock: &'a OwnedLock,
 }
 
 impl InstallRequest<'_> {
@@ -447,7 +447,7 @@ impl Store {
         }
         Ok(state)
     }
-    fn lock(&self, name: &str, exclusive: bool) -> Result<Option<File>> {
+    fn lock(&self, name: &str, exclusive: bool) -> Result<Option<OwnedLock>> {
         self.validate()?;
         let file = filesystem::open_file(&self.directory, OsStr::new(name), true, true)?;
         let locked = if exclusive {
@@ -460,13 +460,23 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(Error::io("Acquire updater lock", error)),
         }
-        self.check_lock(&file, name)?;
-        Ok(Some(file))
+        let lock = OwnedLock {
+            file,
+            owner: std::process::id(),
+        };
+        self.check_lock(&lock, name)?;
+        Ok(Some(lock))
     }
-    fn check_lock(&self, file: &File, name: &str) -> Result<()> {
+    fn check_lock(&self, lock: &OwnedLock, name: &str) -> Result<()> {
+        if lock.owner != std::process::id() {
+            return Err(Error::new(
+                ErrorCode::Ownership,
+                "An inherited updater lock belongs to its original process",
+            ));
+        }
         self.validate()?;
         if !filesystem::same_file(
-            file,
+            &lock.file,
             &filesystem::open_file(&self.directory, OsStr::new(name), false, true)?,
         )? {
             return Err(Error::new(
@@ -524,16 +534,39 @@ impl Store {
     }
 }
 
+/// flock is tied to an open file description, including duplicates temporarily
+/// inherited by a concurrent fork before close-on-exec. Explicitly unlock when
+/// the owning scope ends, so an unrelated child cannot prolong that scope. A
+/// forked child's destructor must never release the original owner's lock.
+#[derive(Debug)]
+struct OwnedLock {
+    file: File,
+    owner: u32,
+}
+impl std::ops::Deref for OwnedLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        if self.owner == std::process::id() {
+            let _ = FileExt::unlock(&self.file);
+        }
+    }
+}
+
 /// Keep this value alive for the *whole* product command, including awaited work.
 /// OS locks release automatically on process death; no PID expiry guesses or
 /// stale lease deletion can release an active process's protection.
 #[derive(Debug)]
 pub struct ActiveLease {
-    file: File,
+    file: OwnedLock,
 }
 impl ActiveLease {
     pub fn is_held(&self) -> bool {
-        self.file.metadata().is_ok()
+        self.file.owner == std::process::id() && self.file.metadata().is_ok()
     }
 }
 
@@ -799,7 +832,7 @@ impl Updater {
         installer: &dyn Installer,
         automatic: bool,
         coordination: &Store,
-        activity_lock: &File,
+        activity_lock: &OwnedLock,
     ) -> Result<VerifiedInstallation> {
         coordination.check_lock(activity_lock, "activity.lock")?;
         let checked = self.inspect()?;
@@ -1184,7 +1217,7 @@ impl Updater {
     fn continue_under_lease(
         &self,
         store: &Store,
-        lock: File,
+        lock: OwnedLock,
         current: &VerifiedInstallation,
         report: UpdateResult,
     ) -> Result<StartupOutcome> {
@@ -1207,5 +1240,77 @@ impl Updater {
     /// import an old implementation's implicit default as an explicit opt-out.
     pub fn initialize_policy_if_absent(&self, saved_policy: Policy) -> Result<Policy> {
         Store::open(&self.paths.state_dir, true)?.initialize_policy(saved_policy)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    struct Temporary(std::path::PathBuf);
+    impl Temporary {
+        fn new() -> Self {
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "hraness-lock-release-test-{}-{}",
+                std::process::id(),
+                SERIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            Self(path)
+        }
+    }
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn ending_shared_lease_releases_a_fork_inherited_description() {
+        let temporary = Temporary::new();
+        let store = Store::open(&temporary.0, true).unwrap();
+        let lease = store.shared().unwrap();
+        // dup has the same flock lifetime as an unrelated concurrent fork's
+        // descriptor before it reaches close-on-exec. Keep it alive to make the
+        // previously intermittent macOS CI failure deterministic on Unix.
+        let _inherited = lease.file.try_clone().unwrap();
+        assert!(store.lock("activity.lock", true).unwrap().is_none());
+        drop(lease);
+        assert!(store.lock("activity.lock", true).unwrap().is_some());
+    }
+
+    #[test]
+    fn ending_exclusive_lock_releases_a_fork_inherited_description() {
+        let temporary = Temporary::new();
+        let store = Store::open(&temporary.0, true).unwrap();
+        let lock = store.lock("activity.lock", true).unwrap().unwrap();
+        let _inherited = lock.try_clone().unwrap();
+        assert!(store.shared().is_err());
+        drop(lock);
+        assert!(store.shared().is_ok());
+    }
+
+    #[test]
+    fn another_process_cannot_use_or_unlock_the_owners_lock() {
+        let temporary = Temporary::new();
+        let store = Store::open(&temporary.0, true).unwrap();
+        let mut inherited = store.lock("activity.lock", true).unwrap().unwrap();
+        let original_description = inherited.try_clone().unwrap();
+        // Model the PID mismatch observed by a child after fork. Its File close
+        // is safe; an explicit LOCK_UN would incorrectly release its parent.
+        inherited.owner = std::process::id().wrapping_add(1);
+        assert_eq!(
+            store
+                .check_lock(&inherited, "activity.lock")
+                .unwrap_err()
+                .code,
+            ErrorCode::Ownership
+        );
+        drop(inherited);
+        assert!(store.shared().is_err());
+        FileExt::unlock(&original_description).unwrap();
+        assert!(store.shared().is_ok());
     }
 }
