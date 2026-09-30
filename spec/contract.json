@@ -1,0 +1,51 @@
+{
+  "schema": "hraness.cli-update.v1",
+  "defaultPolicy": "auto",
+  "minimumCheckIntervalSeconds": 86400,
+  "commands": {
+    "update": "Check and install a newer release from the configured channel in this supported installation.",
+    "update check": "Check without changing installed code.",
+    "update --check": "Alias for update check.",
+    "update status": "Read policy and installation status without network access.",
+    "update enable": "Enable automatic updates for this product.",
+    "update disable": "Disable automatic updates for this product.",
+    "--json": "Return one structured result on stdout; diagnostics use stderr."
+  },
+  "environment": {
+    "HRANESS_NO_UPDATE": "1 disables incidental checking and installation, including after re-entry.",
+    "CI": "A true CI marker disables incidental checking and installation."
+  },
+  "startup": [
+    "Run only at the real executable boundary, before application work; importing the SDK does nothing.",
+    "Help, version, completion and the update command do not trigger a second incidental check.",
+    "Preserve explicit product offline, nested invocation, deployment and exact-version-binding policies.",
+    "A supported installation uses active-command leases and an exclusive update lock shared by aliases. Check leases again under the lock before replacing code.",
+    "A successful automatic update re-enters the same verified installation once with original arguments and stdin before product work. It never replays completed work.",
+    "Metadata/offline failures leave an ordinary command usable. An uncertain or failed code replacement must not execute mixed installed code.",
+    "Do not kill, restart, or reconfigure another process, service, job, or product database."
+  ],
+  "installation": [
+    "Determine ownership from the running entrypoint and verified global package root or native install receipt, not merely a matching executable on PATH.",
+    "Respect the original global manager and exact selected version. Support Bun and npm global installations; other managers get accurate instructions until verified support exists.",
+    "Reject project dependencies, transient runner caches, source checkouts, linked development installs, foreign paths, and ambiguous installations.",
+    "Native installations require a receipt bound to the actual executable path and digest. Product-owned bundled installers or verified atomic replacement may implement installation.",
+    "Preserve native archive verification, platform checks, post-install version checks, rollback, and existing attestation requirements.",
+    "No privilege escalation, shell command interpolation, changing trust policy, or silently opting into a different release channel."
+  ],
+  "release": [
+    "Products fix the package identity and release authority in code.",
+    "Select published semantic versions and compare prereleases correctly. Retain the channel of prerelease-only products through verified release-tag identity.",
+    "No implicit downgrade, Git main install, branch movement, or fallback to an unrelated public/private package.",
+    "Metadata and artifact URLs are validated against the configured provider; malformed or oversized responses fail closed.",
+    "Verify the selected canonical npm archive's SRI and package identity before manager writes; configured scope registries cannot substitute root-package bytes. Preserve the manager's transitive-dependency and lifecycle policies.",
+    "GitHub and native archive flows verify the product's published digest and stronger existing requirements."
+  ],
+  "state": [
+    "Persist updater policy and check cadence in a dedicated user-owned preference directory; bind concurrency records to the actual native executable or owned package-manager global root, independent of preference overrides.",
+    "Keep verified package archives and package installation records beside the owned package-manager global root.",
+    "Retained verified archives are package-manager dependency sources, not disposable caches. Do not remove an archive while an installation references it.",
+    "Refuse foreign or symlinked state paths. Write atomically and validate sizes and owners.",
+    "Do not store provider credentials, product data, command input, or sensitive environment values.",
+    "A saved disabled or notify policy remains authoritative when a newer default becomes automatic."
+  ]
+}
