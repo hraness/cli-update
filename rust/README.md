@@ -4,13 +4,22 @@ Rust 2021 / MSRV 1.85 library for native CLI updates at executable startup. It h
 
 Automatic updates are enabled by default for verified, unpinned native installations on Unix. Source builds, Cargo, Homebrew, foreign paths, missing or mismatched receipts, and pinned installations are ineligible. Windows currently returns an explicit unsupported result; use the product's verified Windows installer. The library does not download and execute installer scripts.
 
+## Install
+
+Add the crate from an immutable release tag:
+
+```toml
+[dependencies]
+hraness-cli-update = { git = "https://github.com/hraness/cli-update", tag = "v0.1.0" }
+```
+
 ## Executable integration
 
 Construct `Updater::new(Product, Paths)` only at the real executable boundary. `new` obtains the actual running path from `std::env::current_exe()`. Never initialize an updater from an SDK import, service callback, or a PATH-selected different binary. `for_executable` is the deterministic fixture/adaptation boundary; production adapters must supply the same OS-reported running path.
 
 The product sets a fixed `owner/repository`, release tag prefix, channel, platform, executable filename, required asset templates, immutability requirement, manual installation instructions, and required `running_identity`. The identity must come from constants embedded in the loaded executable, such as `RunningIdentity::Release { release_tag: concat!("v", env!("CARGO_PKG_VERSION")), build_sha: None }` for products with unique stable package versions. Never read it from the current executable pathname, installed receipt, runtime environment, or release metadata: those may already describe a newer installed image. `RunningIdentity::Source` explicitly marks an unpublished source build and cannot be admitted as a managed release.
 
-Asset templates accept `{tag}`, `{version}` and `{platform}`. `Channel::Prerelease("vm".into())` retains the vm channel and compares `vm.9 < vm.10`; it never silently promotes to stable or another prerelease channel. Prerelease profiles require both the full embedded release tag and full immutable source/build SHA in `running_identity`. ALGAL's shared compiled version `0.2.0` is insufficient: its release build must embed a tag such as `v0.2.0-vm.11` and the verified build SHA, and its installer must retain both in the receipt.
+Asset templates accept `{tag}`, `{version}` and `{platform}`. `Channel::Prerelease("vm".into())` retains the vm channel and compares `vm.9 < vm.10`; it never silently promotes to stable or another prerelease channel. Prerelease profiles require both the full embedded release tag and full immutable source/build SHA in `running_identity`. When prereleases share a compiled package version, that version alone is insufficient: embed the full tag, such as `v0.2.0-vm.11`, and the verified build SHA, and retain both in the installation receipt.
 
 ```rust,ignore
 let updater = Updater::new(product_profile(), product_update_paths())?;
@@ -54,7 +63,7 @@ After acquiring an installation lease, command admission compares the loaded ima
 
 ## Receipt and installer contract
 
-Products must extend their verified initial installer to write `InstallReceipt::SCHEMA` receipts containing the actual executable path and SHA256, complete release tag and numeric GitHub release ID, verified `build_sha` when declared by the running identity (required for prereleases), archive name and SHA256, platform, installation kind, and pin flag. `InstallReceipt::write_verified` verifies current executable bytes and writes the receipt atomically. Existing product metadata, such as ALGAL's hash-bound release record, must also be retained.
+Products must extend their verified initial installer to write `InstallReceipt::SCHEMA` receipts containing the actual executable path and SHA256, complete release tag and numeric GitHub release ID, verified `build_sha` when declared by the running identity (required for prereleases), archive name and SHA256, platform, installation kind, and pin flag. `InstallReceipt::write_verified` verifies current executable bytes and writes the receipt atomically. Retain the product's existing installation metadata too.
 
 The installer must obtain the receipt tag and archive identity from verified release metadata. A binary's `CARGO_PKG_VERSION` alone cannot identify prereleases that intentionally share a compiled package version. A receipt is not a substitute for the product's archive or provenance checks, and the shared library never guesses one for old or copied installations.
 
