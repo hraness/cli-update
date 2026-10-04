@@ -81,6 +81,34 @@ running. If replacing installed code fails or its result cannot be verified,
 the updater stops before running application work and reports the recovery
 step.
 
+## Verify the integration without replacing code
+
+After adding the startup hook, run your CLI's `update status --json`. In the
+example above, the command is `tool update status --json`. A source checkout
+reports `unsupported`; that is expected, not evidence that global installation
+updates are broken. Test supported installation behavior with the repository's
+fake registries and temporary installation roots before using a real global
+package.
+
+On a supported install, `tool update check --json` reports `current` or
+`available` and includes `latestVersion` without replacing installed code. This
+check contacts your configured release service and records the check time.
+`tool update disable` saves an opt-out; it is not a rollback of an update.
+
+## Recover an interrupted update
+
+| Report | Next action |
+| --- | --- |
+| `busy` | Wait for the active command or package-manager operation to finish, then retry. Do not kill unrelated processes or remove their locks. |
+| A previous update did not finish verification | Run the CLI's explicit `update` command or follow its documented reinstall procedure before running product commands. |
+| Repair would require a downgrade | Use the product's documented installer rather than forcing automatic replacement. |
+| `unsupported` | Update through the installation method you already use, such as your package manager. |
+
+Keep release archives referenced by the global installation. Deleting them or
+coordination records is not a repair procedure. If the report says process
+ownership is unknown, inspect the interrupted update and follow the product's
+installer guidance instead of bypassing the check.
+
 ## Supported installations
 
 The TypeScript adapter checks the running entrypoint against the package
