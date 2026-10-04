@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+Consumers can independently pin direct and transitive updater releases.
+
+- Publish the compiled Node/Bun API at a distinct patch coordinate.
+- Keep updater behavior and safety checks unchanged; only package identity and
+  installation documentation change.
+
 ## 0.1.0
 
 Supported installed CLIs can update before a command starts. Integrators get

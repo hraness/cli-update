@@ -7,7 +7,7 @@ commit and the matching immutable Git tag. Rust consumers use that tag.
 Choose a release and download its assets with the GitHub CLI:
 
 ```sh
-tag=v0.1.0
+tag=v0.1.1
 gh release download "$tag" --repo hraness/cli-update --pattern '*.tgz' --pattern SHA256SUMS
 shasum -a 256 -c SHA256SUMS
 gh attestation verify hraness-cli-update-${tag#v}.tgz --repo hraness/cli-update --signer-workflow hraness/cli-update/.github/workflows/release.yml --source-ref "refs/tags/$tag"
