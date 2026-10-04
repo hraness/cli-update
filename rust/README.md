@@ -10,7 +10,7 @@ Add the crate from an immutable release tag:
 
 ```toml
 [dependencies]
-hraness-cli-update = { git = "https://github.com/hraness/cli-update", tag = "v0.1.0" }
+hraness-cli-update = { git = "https://github.com/hraness/cli-update", tag = "v0.1.1" }
 ```
 
 ## Executable integration
