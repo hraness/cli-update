@@ -3,6 +3,30 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { renderNotes, verifyNotes } from './release-notes.mjs';
 
+test('Required remains a Bash-only status gate on slim', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const workflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const block = workflow.split('  Required:\n')[1];
+  assert.equal(block, `    name: Required
+    if: always()
+    needs: [typescript, rust]
+    runs-on: ubuntu-slim
+    timeout-minutes: 1
+    steps:
+      - env:
+          TYPESCRIPT_RESULT: \${{ needs.typescript.result }}
+          RUST_RESULT: \${{ needs.rust.result }}
+        run: test "$TYPESCRIPT_RESULT" = success && test "$RUST_RESULT" = success
+`);
+  const script = block.split('        run: ')[1];
+  for (const TYPESCRIPT_RESULT of ['success', 'failure', 'cancelled', 'skipped', ''])
+    for (const RUST_RESULT of ['success', 'failure', 'cancelled', 'skipped', '']) {
+      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], { env: { PATH: '/nonexistent', TYPESCRIPT_RESULT, RUST_RESULT }, timeout: 1000 });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status === 0, TYPESCRIPT_RESULT === 'success' && RUST_RESULT === 'success');
+    }
+});
+
 const fixture = {
   version: '1.2.3',
   source: 'a'.repeat(40),
