@@ -177,20 +177,31 @@ impl InstallRequest<'_> {
                 "Automatic update was cancelled by a saved policy change before replacement",
             ));
         }
-        let now = self.updater.inspect()?;
-        if now.receipt != self.installation.receipt {
+        // Compare the stored install record, not executable bytes: under a
+        // repair the bytes legitimately differ from the receipt being
+        // replaced, and drifted bytes get overwritten either way.
+        let now = self.updater.stored_receipt()?;
+        if now != self.installation.receipt {
             return Err(Error::new(
                 ErrorCode::Ownership,
                 "Installation changed before replacement",
             ));
         }
-        Ok(now)
+        Ok(VerifiedInstallation { receipt: now })
     }
 
     /// Publish the new receipt only after the verified executable is in place.
     /// The product remains responsible for rollback if this fails.
     pub fn publish_receipt(&self, receipt: &InstallReceipt) -> Result<()> {
         self.updater.validate_target(receipt, self.release)?;
+        // A replacement preserves the recorded pin: repair restores a pinned
+        // install as pinned, and no update may silently set or clear one.
+        if receipt.pinned != self.installation.receipt.pinned {
+            return Err(Error::new(
+                ErrorCode::Ownership,
+                "Install receipt may not change the recorded version pin",
+            ));
+        }
         let existing: InstallReceipt =
             filesystem::read_json(filesystem::open_path(&self.paths.receipt, false)?)?;
         if existing != self.installation.receipt {
@@ -224,6 +235,12 @@ pub enum UpdateStatus {
     Current,
     Available,
     Updated,
+    /// An install whose recorded release stayed selected but whose executable
+    /// bytes were restored because they no longer matched the receipt.
+    Repaired,
+    /// The install receipt is valid but the executable bytes differ from it;
+    /// an explicit `update` restores a verified release.
+    Mismatch,
     Enabled,
     Disabled,
     Unsupported,
@@ -388,6 +405,7 @@ struct State {
     policy: Policy,
     last_check_unix: Option<u64>,
     installation_key: Option<String>,
+    last_repair_unix: Option<u64>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -396,6 +414,7 @@ impl Default for State {
             policy: Policy::Auto,
             last_check_unix: None,
             installation_key: None,
+            last_repair_unix: None,
         }
     }
 }
@@ -683,6 +702,20 @@ impl Updater {
     }
 
     fn inspect_native(&self, allow_pinned: bool) -> Result<VerifiedInstallation> {
+        let installation = self.inspect_receipt_bound(allow_pinned)?;
+        if filesystem::sha256_file(&self.executable)? != installation.receipt.binary_sha256 {
+            return Err(Error::new(
+                ErrorCode::Ownership,
+                "Running executable bytes do not match the native install receipt",
+            ));
+        }
+        Ok(installation)
+    }
+
+    /// Everything `inspect_native` proves except executable byte equality with
+    /// the receipt: a valid product-owned native receipt bound to this managed
+    /// path, outside package-manager and source-checkout locations.
+    fn inspect_receipt_bound(&self, allow_pinned: bool) -> Result<VerifiedInstallation> {
         if !filesystem::supported() {
             return Err(Error::new(ErrorCode::Unsupported, "Native self-update is not yet supported on Windows; use the product's verified Windows installer. No executable or state was changed."));
         }
@@ -720,16 +753,17 @@ impl Updater {
             }
         }
         filesystem::verify_executable_mode(&self.executable)?;
-        if filesystem::sha256_file(&self.executable)? != receipt.binary_sha256 {
-            return Err(Error::new(
-                ErrorCode::Ownership,
-                "Running executable bytes do not match the native install receipt",
-            ));
-        }
         if receipt.pinned && !allow_pinned {
             return Err(Error::new(ErrorCode::Unsupported, "This installation is explicitly version-bound; self-update will not change the pin."));
         }
         Ok(VerifiedInstallation { receipt })
+    }
+
+    /// The stored install record alone. Under an owned lock this is the
+    /// identity a replacement must not disturb; executable bytes are verified
+    /// separately where they matter.
+    fn stored_receipt(&self) -> Result<InstallReceipt> {
+        filesystem::read_json(filesystem::open_path(&self.paths.receipt, false)?)
     }
 
     fn verify_loaded_image(&self, installation: &VerifiedInstallation) -> Result<()> {
@@ -813,10 +847,7 @@ impl Updater {
 
     fn validate_target(&self, receipt: &InstallReceipt, release: &Release) -> Result<()> {
         receipt.validate(&self.product, &self.executable)?;
-        if receipt.pinned
-            || receipt.release_tag != release.tag_name
-            || receipt.release_id != release.id
-        {
+        if receipt.release_tag != release.tag_name || receipt.release_id != release.id {
             return Err(Error::new(
                 ErrorCode::Ownership,
                 "Installed receipt is not for the selected exact release",
@@ -835,8 +866,9 @@ impl Updater {
         activity_lock: &OwnedLock,
     ) -> Result<VerifiedInstallation> {
         coordination.check_lock(activity_lock, "activity.lock")?;
-        let checked = self.inspect()?;
-        if checked.receipt != current.receipt {
+        // Receipt equality is the invariant here; drifted executable bytes are
+        // exactly what this replacement is about to overwrite.
+        if self.stored_receipt()? != current.receipt {
             return Err(Error::new(
                 ErrorCode::Ownership,
                 "Installation changed before update",
@@ -853,9 +885,15 @@ impl Updater {
             activity_lock,
         };
         let result = installer.install(&request);
-        match (result, self.inspect()) {
+        // Post-install verification admits a preserved pin: it checks that the
+        // published receipt and executable bytes again describe the installed
+        // release, not whether the install is self-update eligible.
+        match (result, self.inspect_native(true)) {
             (Ok(()), Ok(after)) => {
                 self.validate_target(&after.receipt, release).map_err(|_| Error::new(ErrorCode::UnsafeInstallation, "Installer did not publish the selected verified release; product work must not continue"))?;
+                if after.receipt.pinned != current.receipt.pinned {
+                    return Err(Error::new(ErrorCode::UnsafeInstallation, "Update changed the installation's recorded version pin; product work must not continue. Restore using the product's verified installer."));
+                }
                 Ok(after)
             }
             (Err(error), Ok(after)) if after.receipt == current.receipt => Err(Error::new(ErrorCode::Installer, format!("Update failed and the original installation remains verified: {error}"))),
@@ -897,16 +935,66 @@ impl Updater {
             ));
         }
         let state = self.state()?;
-        let current = match self.inspect() {
-            Ok(value) => value,
+        let (current, repair) = match self.inspect() {
+            Ok(value) => (value, false),
             Err(error) if error.code == ErrorCode::Unsupported => {
-                return Ok(self.report(
-                    UpdateStatus::Unsupported,
-                    state.policy,
-                    None,
-                    false,
-                    Some(error.message),
-                ))
+                // `inspect()` reports pinned installations as unsupported before
+                // comparing bytes. A pinned install whose bytes drifted repairs
+                // to its recorded pin; everything else reports exactly as before.
+                match self.inspect_receipt_bound(true) {
+                    Ok(bound)
+                        if command == CommandAction::Install
+                            && filesystem::sha256_file(&self.executable)
+                                .is_ok_and(|sha| sha != bound.receipt.binary_sha256) =>
+                    {
+                        (bound, true)
+                    }
+                    _ => {
+                        return Ok(self.report(
+                            UpdateStatus::Unsupported,
+                            state.policy,
+                            None,
+                            false,
+                            Some(error.message),
+                        ))
+                    }
+                }
+            }
+            // The receipt still proves this path is owned by the product's
+            // installer; only the executable bytes drifted (a manual copy, an
+            // interrupted earlier write). An explicit install repairs it;
+            // read-only actions report the mismatch instead of failing.
+            Err(error) if error.code == ErrorCode::Ownership => {
+                let bound = self.inspect_receipt_bound(true)?;
+                match command {
+                    CommandAction::Install => (bound, true),
+                    CommandAction::Check | CommandAction::Status => {
+                        let mut report = self.report(
+                            UpdateStatus::Mismatch,
+                            state.policy,
+                            Some(&bound),
+                            false,
+                            Some("The installed executable does not match its verified install receipt; an explicit `update` restores a verified release.".into()),
+                        );
+                        if command == CommandAction::Check {
+                            report.latest = source
+                                .releases(&self.product)
+                                .ok()
+                                .and_then(|releases| {
+                                    release::select(
+                                        &self.product,
+                                        &bound.receipt.release_tag,
+                                        releases,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                })
+                                .map(|release| release.tag_name);
+                        }
+                        return Ok(report);
+                    }
+                    _ => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         };
@@ -931,13 +1019,27 @@ impl Updater {
                 Some("Another command is using or updating this installation.".into()),
             ));
         };
-        let current = self.inspect()?;
-        self.verify_loaded_image(&current)?;
-        let selected = release::select(
-            &self.product,
-            &current.receipt.release_tag,
-            source.releases(&self.product)?,
-        )?;
+        let current = if repair {
+            // Receipt equality is the admission invariant under repair; the
+            // drifted bytes are exactly what replacement overwrites.
+            if self.stored_receipt()? != current.receipt {
+                return Err(Error::new(
+                    ErrorCode::Ownership,
+                    "Installation changed before repair",
+                ));
+            }
+            current
+        } else {
+            let checked = self.inspect()?;
+            self.verify_loaded_image(&checked)?;
+            checked
+        };
+        let releases = source.releases(&self.product)?;
+        let selected = if repair {
+            self.repair_selection(&current.receipt, releases)?
+        } else {
+            release::select(&self.product, &current.receipt.release_tag, releases)?
+        };
         let Some(release) = selected else {
             return Ok(self.report(
                 UpdateStatus::Current,
@@ -958,6 +1060,11 @@ impl Updater {
             report.latest = Some(release.tag_name);
             return Ok(report);
         }
+        let preserved = if repair {
+            Some(self.preserve_drifted_bytes()?)
+        } else {
+            None
+        };
         let after = self.replace(&current, &release, installer, false, &coordination, &lock)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -966,16 +1073,76 @@ impl Updater {
         store.update(|s| {
             s.last_check_unix = Some(now);
             s.installation_key = Some(self.key());
+            s.last_repair_unix = None;
         })?;
         let mut report = self.report(
-            UpdateStatus::Updated,
+            if repair {
+                UpdateStatus::Repaired
+            } else {
+                UpdateStatus::Updated
+            },
             state.policy,
             Some(&after),
             false,
-            None,
+            preserved.map(|path| {
+                format!(
+                    "The replaced executable was preserved at {}.",
+                    path.display()
+                )
+            }),
         );
         report.latest = Some(release.tag_name);
         Ok(report)
+    }
+
+    /// Select what an explicit repair installs. A pinned installation is
+    /// restored to its recorded pin; otherwise the newest acceptable release
+    /// wins, falling back to reinstalling the recorded release itself.
+    fn repair_selection(
+        &self,
+        receipt: &InstallReceipt,
+        releases: Vec<Release>,
+    ) -> Result<Option<Release>> {
+        let recorded = || {
+            releases
+                .iter()
+                .find(|release| release.tag_name == receipt.release_tag)
+        };
+        let selected = if receipt.pinned {
+            recorded().cloned()
+        } else {
+            match release::select(&self.product, &receipt.release_tag, releases.clone())? {
+                Some(release) => Some(release),
+                None => recorded().cloned(),
+            }
+        };
+        match selected {
+            Some(release) => {
+                release.validate(&self.product)?;
+                Ok(Some(release))
+            }
+            None if receipt.pinned => Err(Error::new(
+                ErrorCode::Release,
+                "The pinned release recorded by this installation is no longer published; repair cannot change the pin.",
+            )),
+            None => Err(Error::new(
+                ErrorCode::Release,
+                "The release recorded by this installation is no longer published; reinstall with the product's verified installer.",
+            )),
+        }
+    }
+
+    /// Preserve the drifted executable bytes beside the install record before
+    /// replacement. The path is receipt-owned, but the replaced bytes may be a
+    /// build someone still wants or evidence worth keeping.
+    fn preserve_drifted_bytes(&self) -> Result<PathBuf> {
+        let sha = filesystem::sha256_file(&self.executable)?;
+        let backup = self
+            .coordination_directory()
+            .join(format!("replaced-{sha}"));
+        std::fs::copy(&self.executable, &backup)
+            .map_err(|error| Error::io("Preserve the replaced executable", error))?;
+        Ok(backup)
     }
 
     /// Product entrypoints with offline, pin, nesting or deployment admission
@@ -1033,6 +1200,22 @@ impl Updater {
                         ),
                     });
                 }
+                // A receipt-owned path whose bytes drifted repairs itself under
+                // the saved automatic policy before any product work runs them.
+                Err(error)
+                    if error.code == ErrorCode::Ownership && self.may_repair(context) =>
+                {
+                    match self.repair_at_startup(context, source, installer) {
+                        Ok(Some(outcome)) => return Ok(outcome),
+                        Ok(None) => return Err(error),
+                        Err(repair_error) => {
+                            return Err(Error::new(
+                                ErrorCode::UnsafeInstallation,
+                                format!("Managed installation could not be verified: {error}. Automatic repair failed: {repair_error}"),
+                            ))
+                        }
+                    }
+                }
                 Err(error) => return Err(error),
             }
         } else {
@@ -1058,10 +1241,23 @@ impl Updater {
                 });
             }
             Err(error) => {
+                if error.code == ErrorCode::Ownership && self.may_repair(context) {
+                    drop(admission);
+                    match self.repair_at_startup(context, source, installer) {
+                        Ok(Some(outcome)) => return Ok(outcome),
+                        Ok(None) => {}
+                        Err(repair_error) => {
+                            return Err(Error::new(
+                                ErrorCode::UnsafeInstallation,
+                                format!("Managed installation could not be verified after admission: {error}. Automatic repair failed: {repair_error}"),
+                            ))
+                        }
+                    }
+                }
                 return Err(Error::new(
                     ErrorCode::UnsafeInstallation,
                     format!("Managed installation could not be verified after admission: {error}"),
-                ))
+                ));
             }
         };
         if preflight.is_some_and(|before| before.receipt != initial.receipt) {
@@ -1212,6 +1408,58 @@ impl Updater {
             ),
             Err(error) => Err(error),
         }
+    }
+
+    /// Repair writes installed code, so it runs only under the saved automatic
+    /// policy and outside incidental-suppression contexts (explicit product
+    /// offline/nested/deployment bindings, CI, `--no-update`, re-entry).
+    fn may_repair(&self, context: &StartupContext) -> bool {
+        !context.no_incidental() && self.state().is_ok_and(|state| state.policy == Policy::Auto)
+    }
+
+    /// Repair a receipt-owned installation whose executable bytes drifted, then
+    /// re-enter the verified image once. Returns None when a repair was already
+    /// attempted recently or did not change the installation; the caller then
+    /// refuses product work on the unverified bytes.
+    fn repair_at_startup(
+        &self,
+        context: &StartupContext,
+        source: &dyn ReleaseSource,
+        installer: &dyn Installer,
+    ) -> Result<Option<StartupOutcome>> {
+        // Bound automatic repair attempts separately from the daily check: a
+        // failing repair does not retry a download on every command start, and
+        // an unrelated recent check must not postpone self-healing.
+        let store = Store::open(&self.paths.state_dir, true)?;
+        let state = store.read()?;
+        let attempted = state.installation_key.as_deref() == Some(self.key().as_str())
+            && state
+                .last_repair_unix
+                .is_some_and(|last| context.now_unix < last || context.now_unix - last < DAY);
+        if attempted {
+            return Ok(None);
+        }
+        store.update(|s| {
+            s.last_repair_unix = Some(context.now_unix);
+            s.installation_key = Some(self.key());
+        })?;
+        let result =
+            self.execute_with_context(CommandAction::Install, context, source, installer)?;
+        if !matches!(
+            result.status,
+            UpdateStatus::Updated | UpdateStatus::Repaired
+        ) {
+            return Ok(None);
+        }
+        let verified = self.inspect()?;
+        let lease = Store::open(&self.coordination_directory(), true)?.shared()?;
+        Ok(Some(StartupOutcome::Reenter(Reentry {
+            updater: Box::new(self.clone()),
+            installation: Box::new(verified),
+            args: context.args.clone(),
+            lease,
+            report: result,
+        })))
     }
 
     fn continue_under_lease(

@@ -21,6 +21,7 @@
     "Preserve explicit product offline, nested invocation, deployment and exact-version-binding policies.",
     "A supported installation uses active-command leases and an exclusive update lock shared by aliases. Check leases again under the lock before replacing code.",
     "A successful automatic update re-enters the same verified installation once with original arguments and stdin before product work. It never replays completed work.",
+    "A valid native receipt whose executable bytes drifted is repairable: explicit `update` reinstalls a verified release under any policy, and automatic-policy startups repair and re-enter before product work. The drifted image never runs product work; repair failure or a non-automatic policy fails closed.",
     "Metadata/offline failures leave an ordinary command usable. An uncertain or failed code replacement must not execute mixed installed code.",
     "Do not kill, restart, or reconfigure another process, service, job, or product database."
   ],
