@@ -1653,3 +1653,336 @@ fn delayed_old_compiled_image_is_rejected_after_atomic_path_replacement() {
         b"v1.1.0"
     );
 }
+
+fn drift_executable(fixture: &Fixture, bytes: &[u8]) {
+    // Simulate a manual copy over the managed path: the receipt stays the
+    // record of a verified install while the bytes no longer match it.
+    fs::write(&fixture.executable, bytes).unwrap();
+    fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn startup_error(outcome: Result<StartupOutcome>) -> Error {
+    match outcome {
+        Err(error) => error,
+        _ => panic!("expected startup error"),
+    }
+}
+
+fn preserved_drift(fixture: &Fixture, drifted: &[u8]) -> PathBuf {
+    fixture
+        .executable
+        .parent()
+        .unwrap()
+        .join(format!(".hraness-cli-update-{}", fixture.product.id))
+        .join(format!("replaced-{}", digest(drifted)))
+}
+
+#[test]
+fn drifted_executable_reports_mismatch_and_explicit_update_repairs() {
+    let fixture = Fixture::new();
+    let drifted = b"#!/bin/sh\nexit 99\n";
+    drift_executable(&fixture, drifted);
+
+    // Read-only actions diagnose the drift instead of failing before dispatch.
+    let status = fixture
+        .updater
+        .execute(CommandAction::Status, &Never, &Never)
+        .unwrap();
+    assert_eq!(status.status, UpdateStatus::Mismatch);
+    assert_eq!(status.current.as_deref(), Some("v1.0.0"));
+    assert!(status.reason.unwrap().contains("receipt"));
+    let check = fixture
+        .updater
+        .execute(CommandAction::Check, &fixture.source("v1.1.0"), &Never)
+        .unwrap();
+    assert_eq!(check.status, UpdateStatus::Mismatch);
+    assert_eq!(check.current.as_deref(), Some("v1.0.0"));
+    assert_eq!(check.latest.as_deref(), Some("v1.1.0"));
+
+    // An explicit update reinstalls a verified release: drifted bytes are
+    // preserved beside the install record and the receipt again matches the
+    // executable it describes.
+    let installer = Replace::new();
+    let report = fixture
+        .updater
+        .execute(
+            CommandAction::Install,
+            &fixture.source("v1.1.0"),
+            &installer,
+        )
+        .unwrap();
+    assert_eq!(report.status, UpdateStatus::Repaired);
+    assert_eq!(report.current.as_deref(), Some("v1.1.0"));
+    assert_eq!(report.latest.as_deref(), Some("v1.1.0"));
+    assert!(report.reason.unwrap().contains("preserved"));
+    assert_eq!(fs::read(&fixture.executable).unwrap(), installer.bytes);
+    assert_eq!(fixture.receipt().release_tag, "v1.1.0");
+    assert_eq!(
+        fs::read(preserved_drift(&fixture, drifted)).unwrap(),
+        drifted
+    );
+    fixture.updater.inspect().unwrap();
+}
+
+#[test]
+fn drift_repairs_to_recorded_release_when_nothing_newer_exists() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    let report = fixture
+        .updater
+        .execute(
+            CommandAction::Install,
+            &fixture.source("v1.0.0"),
+            &Replace::new(),
+        )
+        .unwrap();
+    assert_eq!(report.status, UpdateStatus::Repaired);
+    assert_eq!(report.latest.as_deref(), Some("v1.0.0"));
+    assert_eq!(fixture.receipt().release_tag, "v1.0.0");
+    fixture.updater.inspect().unwrap();
+}
+
+#[test]
+fn drifted_install_without_published_recorded_release_fails_closed() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    let source = Source {
+        releases: vec![release_for(&fixture.product, "v0.9.0")],
+        calls: Cell::new(0),
+        offline: false,
+    };
+    let error = fixture
+        .updater
+        .execute(CommandAction::Install, &source, &Replace::new())
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Release);
+    assert_eq!(fs::read(&fixture.executable).unwrap(), b"drifted");
+}
+
+#[test]
+fn drifted_pinned_install_repairs_to_its_pin() {
+    let fixture = Fixture::new();
+    let mut receipt = fixture.receipt();
+    receipt.pinned = true;
+    fixture.raw_receipt(&receipt);
+    drift_executable(&fixture, b"drifted");
+    // Both tags remain published; the pin wins over the newer release.
+    let source = Source {
+        releases: vec![
+            release_for(&fixture.product, "v1.0.0"),
+            release_for(&fixture.product, "v1.1.0"),
+        ],
+        calls: Cell::new(0),
+        offline: false,
+    };
+    let report = fixture
+        .updater
+        .execute(CommandAction::Install, &source, &Replace::new())
+        .unwrap();
+    assert_eq!(report.status, UpdateStatus::Repaired);
+    assert_eq!(report.latest.as_deref(), Some("v1.0.0"));
+    // The pin is preserved and the receipt again describes the bytes on disk.
+    let receipt = fixture.receipt();
+    assert_eq!(receipt.release_tag, "v1.0.0");
+    assert!(receipt.pinned);
+    assert_eq!(
+        receipt.binary_sha256,
+        digest(&fs::read(&fixture.executable).unwrap())
+    );
+}
+
+#[test]
+fn startup_repairs_drift_and_reenters_verified_image() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    let outcome = fixture
+        .updater
+        .startup(
+            &fixture.context(),
+            &fixture.source("v1.1.0"),
+            &Replace::new(),
+        )
+        .unwrap();
+    let reentry = match outcome {
+        StartupOutcome::Reenter(reentry) => reentry,
+        _ => panic!("expected reentry after automatic repair"),
+    };
+    assert_eq!(reentry.report.status, UpdateStatus::Repaired);
+    assert_eq!(reentry.report.latest.as_deref(), Some("v1.1.0"));
+    drop(reentry);
+    fixture.updater.inspect().unwrap();
+
+    // The re-entered process is the repaired image: model it with the new
+    // embedded release identity and confirm it continues as an ordinary
+    // current installation without repeating repair or touching the network.
+    let mut product = fixture.product.clone();
+    product.running_identity = RunningIdentity::Release {
+        release_tag: "v1.1.0",
+        build_sha: None,
+    };
+    let reentered =
+        Updater::for_executable(product, fixture.paths.clone(), fixture.executable.clone())
+            .unwrap();
+    let mut context = fixture.context();
+    context.reentered = true;
+    let source = fixture.source("v1.1.0");
+    let (lease, report) = continuing(reentered.startup(&context, &source, &Never).unwrap());
+    assert_eq!(report.status, UpdateStatus::Skipped);
+    assert_eq!(source.calls.get(), 0);
+    assert!(lease.is_some());
+}
+
+#[test]
+fn drifted_startup_fails_closed_under_disabled_policy_but_update_repairs() {
+    let fixture = Fixture::new();
+    // A prior healthy startup leaves the coordination records a real managed
+    // installation has, so the drifted startup exercises the admission arm.
+    let _ = continuing(
+        fixture
+            .updater
+            .startup(&fixture.context(), &fixture.source("v1.0.0"), &Never)
+            .unwrap(),
+    );
+    drift_executable(&fixture, b"drifted");
+    fixture
+        .updater
+        .execute(CommandAction::Disable, &Never, &Never)
+        .unwrap();
+    let source = fixture.source("v1.1.0");
+    let installer = Replace::new();
+    let error = startup_error(
+        fixture
+            .updater
+            .startup(&fixture.context(), &source, &installer),
+    );
+    assert_eq!(error.code, ErrorCode::UnsafeInstallation);
+    assert_eq!(source.calls.get(), 0);
+    assert_eq!(installer.calls.get(), 0);
+
+    // The saved opt-out suppresses only automatic repair; an explicit update
+    // still restores a verified release.
+    let report = fixture
+        .updater
+        .execute(
+            CommandAction::Install,
+            &fixture.source("v1.0.0"),
+            &installer,
+        )
+        .unwrap();
+    assert_eq!(report.status, UpdateStatus::Repaired);
+    fixture.updater.inspect().unwrap();
+}
+
+#[test]
+fn drifted_startup_suppressing_contexts_never_repair() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    for context in [
+        StartupContext {
+            offline: true,
+            ..fixture.context()
+        },
+        StartupContext {
+            ci: true,
+            ..fixture.context()
+        },
+        StartupContext {
+            reentered: true,
+            ..fixture.context()
+        },
+        StartupContext {
+            no_update: true,
+            ..fixture.context()
+        },
+    ] {
+        let source = fixture.source("v1.1.0");
+        let installer = Replace::new();
+        let error = startup_error(fixture.updater.startup(&context, &source, &installer));
+        assert_eq!(error.code, ErrorCode::Ownership);
+        assert_eq!(source.calls.get(), 0);
+        assert_eq!(installer.calls.get(), 0);
+    }
+}
+
+#[test]
+fn failed_startup_repair_stays_closed_and_is_daily_bounded() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    let failing = Source {
+        releases: vec![release_for(&fixture.product, "v1.1.0")],
+        calls: Cell::new(0),
+        offline: true,
+    };
+    let error = startup_error(fixture.updater.startup(
+        &fixture.context(),
+        &failing,
+        &Replace::new(),
+    ));
+    assert_eq!(error.code, ErrorCode::UnsafeInstallation);
+    assert!(error.message.contains("repair failed"));
+    assert_eq!(failing.calls.get(), 1);
+
+    // The attempt is recorded like the daily check: the next startup does not
+    // retry the network even though a healthy source would now succeed.
+    let healthy = fixture.source("v1.1.0");
+    let error = startup_error(fixture.updater.startup(
+        &fixture.context(),
+        &healthy,
+        &Replace::new(),
+    ));
+    assert_eq!(error.code, ErrorCode::UnsafeInstallation);
+    assert_eq!(healthy.calls.get(), 0);
+}
+
+#[test]
+fn drifted_executable_still_rejects_foreign_receipts() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    let mut receipt = fixture.receipt();
+    receipt.executable = fixture.executable.with_file_name("different");
+    fixture.raw_receipt(&receipt);
+    for action in [CommandAction::Install, CommandAction::Check] {
+        assert_eq!(
+            fixture
+                .updater
+                .execute(action, &fixture.source("v1.1.0"), &Replace::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::Ownership
+        );
+    }
+}
+
+#[test]
+fn drifted_installer_failure_leaves_mismatch_closed() {
+    let fixture = Fixture::new();
+    drift_executable(&fixture, b"drifted");
+    // A failure after replacing bytes but before publishing the receipt leaves
+    // an uncertain installation: still mismatched, still refusing admission,
+    // still repairable by a subsequent explicit update.
+    let mut installer = Replace::new();
+    installer.failure = Some("after");
+    let error = fixture
+        .updater
+        .execute(
+            CommandAction::Install,
+            &fixture.source("v1.1.0"),
+            &installer,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsafeInstallation);
+    assert_eq!(
+        fixture.updater.inspect().unwrap_err().code,
+        ErrorCode::Ownership
+    );
+    let report = fixture
+        .updater
+        .execute(
+            CommandAction::Install,
+            &fixture.source("v1.0.0"),
+            &Replace::new(),
+        )
+        .unwrap();
+    assert_eq!(report.status, UpdateStatus::Repaired);
+    fixture.updater.inspect().unwrap();
+}

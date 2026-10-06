@@ -100,6 +100,7 @@ check contacts your configured release service and records the check time.
 | Report | Next action |
 | --- | --- |
 | `busy` | Wait for the active command or package-manager operation to finish, then retry. Do not kill unrelated processes or remove their locks. |
+| `mismatch` | The installed executable does not match its verified install receipt. An explicit `update` reinstalls a verified release; automatic-policy startups already repaired and re-entered. |
 | A previous update did not finish verification | Run the CLI's explicit `update` command or follow its documented reinstall procedure before running product commands. |
 | Repair would require a downgrade | Use the product's documented installer rather than forcing automatic replacement. |
 | `unsupported` | Update through the installation method you already use, such as your package manager. |
