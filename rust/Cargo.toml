@@ -1,6 +1,6 @@
 [package]
 name = "hraness-cli-update"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Policy, ownership, and release verification for Hraness native CLI updates"
