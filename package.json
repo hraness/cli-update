@@ -1,6 +1,6 @@
 {
   "name": "@hraness/cli-update",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Automatic updates for installed CLIs, with installation checks and a shared opt-out.",
   "license": "MIT",
   "type": "module",

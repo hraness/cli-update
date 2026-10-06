@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2
+
+Native installations whose executable bytes drifted from their verified
+install receipt repair instead of deadlocking.
+
+- An explicit `update` reinstalls a verified release, preserving the drifted
+  bytes beside the install record and restoring a pinned install to its pin.
+- `update status` and `update check` report `mismatch` instead of failing
+  before command dispatch.
+- Automatic-policy startups repair and re-enter the verified image before
+  product work; saved opt-outs and incidental-suppression contexts fail closed
+  exactly as before. Attempts are bounded daily by a dedicated stamp.
+- Replacement transactions keep every ownership check: the stored receipt is
+  the invariant, the recorded pin may no longer be changed by a replacement,
+  and foreign or ambiguous installations still refuse to run.
+
 ## 0.1.1
 
 Consumers can independently pin direct and transitive updater releases.

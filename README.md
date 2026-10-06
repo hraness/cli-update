@@ -16,7 +16,7 @@ automatic updates off or request an update directly.
 Requires Node 22 or Bun 1.3.14 or later. Install the released library archive:
 
 ```sh
-bun add https://github.com/hraness/cli-update/releases/download/v0.1.1/hraness-cli-update-0.1.1.tgz
+bun add https://github.com/hraness/cli-update/releases/download/v0.1.2/hraness-cli-update-0.1.2.tgz
 ```
 
 Automatic package replacement currently supports macOS and Linux global
